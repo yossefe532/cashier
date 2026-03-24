@@ -13,20 +13,27 @@ git remote add origin https://github.com/<USERNAME>/<REPO>.git
 git push -u origin main
 ```
 
-## 2) النشر على Render
-- افتح Render واختر **Blueprint**.
-- اربط Repository.
-- اختر الملف `render.yaml`.
-- سيقوم Render بإنشاء:
-  - خدمة Backend: `educon-pos-api`
-  - خدمة Frontend: `educon-pos-web`
-  - قاعدة بيانات PostgreSQL: `educon-pos-db`
+## 2) النشر على Railway
+- افتح Railway ثم **New Project**.
+- اختر **Deploy from GitHub repo** وحدد نفس المستودع.
+- أضف خدمة قاعدة بيانات: **PostgreSQL**.
+- أنشئ خدمة Backend من نفس الريبو بالإعدادات التالية:
+  - Root Directory: `/`
+  - Build Command: `pip install -r requirements.txt`
+  - Start Command: `uvicorn main:app --host 0.0.0.0 --port $PORT`
+  - متغيرات البيئة:
+    - `DATABASE_URL=${{Postgres.DATABASE_URL}}`
+- أنشئ خدمة Frontend من نفس الريبو بالإعدادات التالية:
+  - Root Directory: `pos-frontend`
+  - Build Command: `npm ci && npm run build`
+  - Start Command: `npm run preview -- --host 0.0.0.0 --port $PORT`
+  - متغيرات البيئة:
+    - `VITE_API_BASE_URL=https://<backend-domain>.up.railway.app`
 
-## 3) ربط واجهة الويب بالباكند
-- بعد أول Deploy، افتح خدمة `educon-pos-web`.
-- تأكد أن المتغير `VITE_API_BASE_URL` يساوي رابط خدمة الباكند النهائي، مثل:
-  - `https://educon-pos-api.onrender.com`
-- أعد Deploy للواجهة.
+## 3) ربط الدومينات
+- فعّل Public Domain لخدمة الباكند وخدمة الواجهة من Railway.
+- ضع دومين الباكند النهائي في متغير `VITE_API_BASE_URL` داخل خدمة الواجهة.
+- أعد Deploy للواجهة بعد تحديث المتغير.
 
 ## 4) اختبار بعد النشر
 - افتح:
@@ -37,4 +44,10 @@ git push -u origin main
 ## 5) ملاحظات إنتاج مهمة
 - الحذف للطلاب والكتب معطّل على الباكند لحماية البيانات.
 - عند SQLite محليًا يتم أخذ نسخة احتياطية تلقائية.
-- في الإنتاج على Render يتم استخدام PostgreSQL عبر `DATABASE_URL`.
+- في الإنتاج على Railway يتم استخدام PostgreSQL عبر `DATABASE_URL`.
+
+## 6) ملفات مضافة لتسهيل Railway
+- [Procfile](file:///e:/شغل/شغل/project/Procfile) لخدمة الباكند.
+- [railway.json](file:///e:/شغل/شغل/project/railway.json) لخدمة الباكند.
+- [pos-frontend/Procfile](file:///e:/شغل/شغل/project/pos-frontend/Procfile) لخدمة الواجهة.
+- [pos-frontend/railway.json](file:///e:/شغل/شغل/project/pos-frontend/railway.json) لخدمة الواجهة.
