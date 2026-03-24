@@ -1,0 +1,100 @@
+@import url('https://fonts.googleapis.com/css2?family=Cairo:wght@300;400;600;700&family=Sora:wght@300;400;500;600;700&display=swap');
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  color-scheme: light;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  font-family: 'Sora', 'Cairo', system-ui, sans-serif;
+  background: radial-gradient(circle at top, #fff5f5 0%, #fff 45%, #ffecec 100%);
+  color: #1f2937;
+}
+
+html.dark body {
+  background: #0f172a !important;
+  color: #f1f5f9 !important;
+}
+
+html.dark {
+  color-scheme: dark;
+}
+
+.dark .rounded-3xl.bg-white {
+  background-color: #1e293b !important;
+  border-color: #334155 !important;
+}
+
+html.dark .rounded-2xl.border-slate-100,
+html.dark .border-slate-200 {
+  border-color: #334155 !important;
+}
+
+.dark .bg-slate-50 {
+  background-color: #1e293b !important;
+}
+
+html.dark .text-slate-900,
+.dark .text-slate-900 {
+  color: #f1f5f9 !important;
+}
+
+html.dark .text-slate-500,
+html.dark .text-slate-600,
+html.dark .text-slate-400 {
+  color: #94a3b8 !important;
+}
+
+.dark input,
+.dark select,
+.dark textarea {
+  background-color: #334155 !important;
+  border-color: #475569 !important;
+  color: #f1f5f9 !important;
+}
+
+.dark .divide-slate-100 > * {
+  border-color: #334155 !important;
+}
+
+.dark table th {
+  color: #94a3b8 !important;
+}
+
+html.dark table td {
+  color: #e2e8f0 !important;
+}
+
+.dark .hover\:bg-slate-50\/50:hover {
+  background-color: rgba(30, 41, 59, 0.8) !important;
+}
+
+body[dir='rtl'] {
+  font-family: 'Cairo', 'Sora', system-ui, sans-serif;
+}
+
+#root {
+  min-height: 100vh;
+}
+
+html.dark #root {
+  background: #0f172a;
+}
+
+@media print {
+  body {
+    background: #fff;
+  }
+
+  .no-print {
+    display: none !important;
+  }
+}

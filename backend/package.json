@@ -1,0 +1,7 @@
+{
+  "name": "educon-pos-backend",
+  "type": "module",
+  "dependencies": {
+    "@cloudflare/containers": "^0.1.0"
+  }
+}
