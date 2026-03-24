@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import {
   BookOpen,
   Users,
@@ -249,6 +249,8 @@ const buildReceiptText = ({
 }
 
 const STORAGE_KEY = 'educon-pos-state-v1'
+const SYNC_QUEUE_KEY = 'educon-pos-sync-queue-v1'
+const SYNC_MAP_KEY = 'educon-pos-sync-map-v1'
 
 const readStoredSnapshot = () => {
   if (typeof localStorage === 'undefined') return null
@@ -260,6 +262,18 @@ const readStoredSnapshot = () => {
     return data
   } catch {
     return null
+  }
+}
+
+const readJsonStorage = (key, fallbackValue) => {
+  if (typeof localStorage === 'undefined') return fallbackValue
+  try {
+    const raw = localStorage.getItem(key)
+    if (!raw) return fallbackValue
+    const parsed = JSON.parse(raw)
+    return parsed ?? fallbackValue
+  } catch {
+    return fallbackValue
   }
 }
 
@@ -540,6 +554,12 @@ function App() {
   const [financeReport, setFinanceReport] = useState(null)
   const [supplies, setSupplies] = useState([])
   const [supplyForm, setSupplyForm] = useState({ bookId: '', qty: '1', unitCost: '', paid: '', supplier: '' })
+  const [syncQueue, setSyncQueue] = useState(() => readJsonStorage(SYNC_QUEUE_KEY, []))
+  const [syncMap, setSyncMap] = useState(() =>
+    readJsonStorage(SYNC_MAP_KEY, { students: {}, books: {}, reservations: {} }),
+  )
+  const [isSyncing, setIsSyncing] = useState(false)
+  const syncInFlightRef = useRef(false)
   const inputRef = useRef(null)
 
   const whatsappGroupLinks = adminWhatsappLinks || defaultWhatsappGroupLinks
@@ -632,6 +652,293 @@ function App() {
     auditActualCash,
     walletLog, // Depend on Wallet Log
   ])
+
+  useEffect(() => {
+    try {
+      localStorage.setItem(SYNC_QUEUE_KEY, JSON.stringify(syncQueue))
+    } catch (error) {
+      void error
+    }
+  }, [syncQueue])
+
+  useEffect(() => {
+    try {
+      localStorage.setItem(SYNC_MAP_KEY, JSON.stringify(syncMap))
+    } catch (error) {
+      void error
+    }
+  }, [syncMap])
+
+  const enqueueSync = useCallback((operation) => {
+    setSyncQueue((prev) => [
+      ...prev,
+      {
+        id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+        createdAt: new Date().toISOString(),
+        ...operation,
+      },
+    ])
+  }, [])
+
+  const findServerStudentId = useCallback(
+    async (localStudentId) => {
+      if (localStudentId == null) return null
+      const asKey = String(localStudentId)
+      const mapped = syncMap.students?.[asKey]
+      if (mapped) return mapped
+      const localStudent = students.find((s) => String(s.id) === asKey)
+      if (!localStudent) return Number(localStudentId)
+      const serverStudents = await apiRequest('/students')
+      const exact = Array.isArray(serverStudents)
+        ? serverStudents.find(
+            (s) =>
+              (localStudent.phone && s.phone && s.phone === localStudent.phone) ||
+              s.name?.trim().toLowerCase() === localStudent.name?.trim().toLowerCase(),
+          )
+        : null
+      if (exact?.id != null) {
+        const serverId = Number(exact.id)
+        setSyncMap((prev) => ({
+          ...prev,
+          students: { ...(prev.students || {}), [asKey]: serverId },
+        }))
+        return serverId
+      }
+      const created = await apiRequest('/students', {
+        method: 'POST',
+        body: JSON.stringify(
+          mapUiStudentToApi({
+            ...localStudent,
+            balance: Number(localStudent.balance) || 0,
+          }),
+        ),
+      })
+      const serverId = Number(created.id)
+      setSyncMap((prev) => ({
+        ...prev,
+        students: { ...(prev.students || {}), [asKey]: serverId },
+      }))
+      return serverId
+    },
+    [students, syncMap.students],
+  )
+
+  const findServerBookId = useCallback(
+    async (localBookId) => {
+      if (localBookId == null) return null
+      const asKey = String(localBookId)
+      const mapped = syncMap.books?.[asKey]
+      if (mapped) return mapped
+      const localBook = books.find((b) => String(b.id) === asKey)
+      if (!localBook) return Number(localBookId)
+      const serverBooks = await apiRequest('/books')
+      const exact = Array.isArray(serverBooks)
+        ? serverBooks.find(
+            (b) =>
+              (localBook.barcode && b.isbn_barcode && b.isbn_barcode === localBook.barcode) ||
+              (b.title?.trim().toLowerCase() === localBook.title?.trim().toLowerCase() &&
+                b.author?.trim().toLowerCase() === localBook.author?.trim().toLowerCase()),
+          )
+        : null
+      if (exact?.id != null) {
+        const serverId = Number(exact.id)
+        setSyncMap((prev) => ({
+          ...prev,
+          books: { ...(prev.books || {}), [asKey]: serverId },
+        }))
+        return serverId
+      }
+      const created = await apiRequest('/books', {
+        method: 'POST',
+        body: JSON.stringify(
+          mapUiBookToApi({
+            ...localBook,
+            reservedStock: Number(localBook.reservedStock) || 0,
+          }),
+        ),
+      })
+      const serverId = Number(created.id)
+      setSyncMap((prev) => ({
+        ...prev,
+        books: { ...(prev.books || {}), [asKey]: serverId },
+      }))
+      return serverId
+    },
+    [books, syncMap.books],
+  )
+
+  const processSyncQueue = useCallback(async () => {
+    if (!useBackend || syncInFlightRef.current || syncQueue.length === 0) return
+    syncInFlightRef.current = true
+    setIsSyncing(true)
+    let remaining = [...syncQueue]
+    try {
+      while (remaining.length > 0) {
+        const op = remaining[0]
+        if (op.type === 'book_upsert') {
+          const payload = op.payload
+          if (op.mode === 'edit') {
+            const serverBookId = await findServerBookId(op.localId)
+            await apiRequest(`/books/${serverBookId}`, {
+              method: 'PUT',
+              body: JSON.stringify(mapUiBookToApi({ ...payload, reservedStock: payload.reservedStock ?? 0 })),
+            })
+          } else {
+            await findServerBookId(op.localId)
+          }
+        } else if (op.type === 'student_upsert') {
+          const payload = op.payload
+          if (op.mode === 'edit') {
+            const serverStudentId = await findServerStudentId(op.localId)
+            await apiRequest(`/students/${serverStudentId}`, {
+              method: 'PUT',
+              body: JSON.stringify(mapUiStudentToApi({ ...payload, balance: payload.balance ?? 0 })),
+            })
+          } else {
+            await findServerStudentId(op.localId)
+          }
+        } else if (op.type === 'reservation_create') {
+          const serverStudentId = await findServerStudentId(op.payload.studentId)
+          const serverBookId = await findServerBookId(op.payload.bookId)
+          const created = await apiRequest('/reservations', {
+            method: 'POST',
+            body: JSON.stringify({
+              student_id: serverStudentId,
+              book_id: serverBookId,
+              quantity: op.payload.qty,
+              deposit_amount: op.payload.deposit || 0,
+              staff_name: op.payload.staffName,
+            }),
+          })
+          if (op.localReservationId != null && created?.id != null) {
+            setSyncMap((prev) => ({
+              ...prev,
+              reservations: {
+                ...(prev.reservations || {}),
+                [String(op.localReservationId)]: Number(created.id),
+              },
+            }))
+          }
+        } else if (op.type === 'transaction_create') {
+          const serverStudentId = await findServerStudentId(op.payload.studentId)
+          const items = []
+          for (const item of op.payload.items || []) {
+            const serverBookId = await findServerBookId(item.bookId)
+            let reservationId = null
+            if (item.reservationId != null) {
+              reservationId = syncMap.reservations?.[String(item.reservationId)] || null
+            }
+            items.push({
+              book_id: serverBookId,
+              quantity: item.qty,
+              reservation_id: reservationId,
+            })
+          }
+          if (items.length > 0) {
+            await apiRequest('/transactions', {
+              method: 'POST',
+              body: JSON.stringify({
+                student_id: serverStudentId,
+                discount: op.payload.discount || 0,
+                staff_name: op.payload.staffName,
+                items,
+              }),
+            })
+          }
+        } else if (op.type === 'student_balance_set') {
+          const serverStudentId = await findServerStudentId(op.payload.studentId)
+          await apiRequest(`/students/${serverStudentId}`, {
+            method: 'PUT',
+            body: JSON.stringify(
+              mapUiStudentToApi({
+                ...op.payload.studentSnapshot,
+                balance: op.payload.balance,
+              }),
+            ),
+          })
+        } else if (op.type === 'reservation_cancel') {
+          const localId = String(op.payload.reservationId)
+          const serverReservationId = syncMap.reservations?.[localId] || op.payload.reservationId
+          await apiRequest(`/reservations/${serverReservationId}`, { method: 'DELETE' })
+          if (op.payload.refundMethod === 'cash' && op.payload.refundAmount > 0) {
+            await apiRequest('/safe/emergency-withdrawals', {
+              method: 'POST',
+              body: JSON.stringify({
+                amount: op.payload.refundAmount,
+                reason: 'Refund cancelled reservation',
+                staff_name: op.payload.staffName,
+              }),
+            })
+          }
+          if (op.payload.refundMethod === 'wallet') {
+            const serverStudentId = await findServerStudentId(op.payload.studentId)
+            await apiRequest(`/students/${serverStudentId}`, {
+              method: 'PUT',
+              body: JSON.stringify(
+                mapUiStudentToApi({
+                  ...op.payload.studentSnapshot,
+                  balance: op.payload.nextBalance,
+                }),
+              ),
+            })
+          }
+        } else if (op.type === 'emergency_withdrawal') {
+          await apiRequest('/safe/emergency-withdrawals', {
+            method: 'POST',
+            body: JSON.stringify({
+              amount: op.payload.amount,
+              reason: op.payload.reason || null,
+              staff_name: op.payload.staffName,
+            }),
+          })
+        } else if (op.type === 'receipt_archive') {
+          await apiRequest('/receipt-archive', {
+            method: 'POST',
+            body: JSON.stringify({
+              transaction_code: op.payload.transactionCode || null,
+              receipt_type: op.payload.receiptType,
+              staff_name: op.payload.staffName || null,
+              payload: op.payload.payload,
+            }),
+          })
+        }
+        remaining.shift()
+        setSyncQueue([...remaining])
+      }
+    } catch (error) {
+      void error
+    } finally {
+      syncInFlightRef.current = false
+      setIsSyncing(false)
+    }
+  }, [findServerBookId, findServerStudentId, syncMap.reservations, syncQueue, useBackend])
+
+  useEffect(() => {
+    if (!useBackend || syncQueue.length === 0) return
+    processSyncQueue()
+  }, [useBackend, syncQueue, processSyncQueue])
+
+  useEffect(() => {
+    if (useBackend) return
+    let mounted = true
+    let timer = null
+    const probe = async () => {
+      try {
+        await apiRequest('/books')
+        if (!mounted) return
+        setUseBackend(true)
+      } catch (error) {
+        void error
+        if (!mounted) return
+        timer = setTimeout(probe, 5000)
+      }
+    }
+    probe()
+    return () => {
+      mounted = false
+      if (timer) clearTimeout(timer)
+    }
+  }, [useBackend])
 
   useEffect(() => {
     if (!useBackend) return
@@ -1072,6 +1379,15 @@ function App() {
         }
         return [...prev, local]
       })
+      enqueueSync({
+        type: 'book_upsert',
+        mode: bookModal.mode,
+        localId: local.id,
+        payload: {
+          ...local,
+          reservedStock: bookModal.data?.reservedStock ?? 0,
+        },
+      })
       setBookModal({ open: false, mode: 'add', data: null })
       return
     }
@@ -1134,6 +1450,15 @@ function App() {
         }
         return [...prev, local]
       })
+      enqueueSync({
+        type: 'student_upsert',
+        mode: studentModal.mode,
+        localId: local.id,
+        payload: {
+          ...local,
+          balance: studentModal.data?.balance ?? 0,
+        },
+      })
       setStudentModal({ open: false, mode: 'add', data: null })
       return
     }
@@ -1172,6 +1497,15 @@ function App() {
         ...quickStudent,
       }
       setStudents((prev) => [...prev, payload])
+      enqueueSync({
+        type: 'student_upsert',
+        mode: 'add',
+        localId: payload.id,
+        payload: {
+          ...payload,
+          balance: 0,
+        },
+      })
       setSelectedStudentId(String(payload.id))
       setQuickStudent({
         name: '',
@@ -1206,20 +1540,51 @@ function App() {
     })
   }
 
-  const handleEmergencySubmit = (event) => {
+  const handleEmergencySubmit = async (event) => {
     event.preventDefault()
     const amountValue = Number(emergencyForm.amount)
     if (!amountValue || amountValue <= 0) return
+    const staffName = emergencyForm.staffId || selectedStaffId
     setWithdrawals((prev) => [
       ...prev,
       {
         id: Date.now(),
         amount: amountValue,
         reason: emergencyForm.reason,
-        staffId: emergencyForm.staffId || selectedStaffId,
+        staffId: staffName,
         date: new Date().toISOString(),
       },
     ])
+    if (useBackend) {
+      try {
+        await apiRequest('/safe/emergency-withdrawals', {
+          method: 'POST',
+          body: JSON.stringify({
+            amount: amountValue,
+            reason: emergencyForm.reason || null,
+            staff_name: staffName,
+          }),
+        })
+      } catch {
+        enqueueSync({
+          type: 'emergency_withdrawal',
+          payload: {
+            amount: amountValue,
+            reason: emergencyForm.reason || null,
+            staffName,
+          },
+        })
+      }
+    } else {
+      enqueueSync({
+        type: 'emergency_withdrawal',
+        payload: {
+          amount: amountValue,
+          reason: emergencyForm.reason || null,
+          staffName,
+        },
+      })
+    }
     setEmergencyForm({ amount: '', reason: '', staffId: '' })
   }
 
@@ -1238,6 +1603,15 @@ function App() {
           specialty: quickStudent.specialty || '',
         }
         setStudents((prev) => [...prev, newStudent])
+        enqueueSync({
+          type: 'student_upsert',
+          mode: 'add',
+          localId: newStudent.id,
+          payload: {
+            ...newStudent,
+            balance: 0,
+          },
+        })
         setSelectedStudentId(String(newStudent.id))
         setQuickStudent({ name: '', phone: '', stage: 'first', gender: 'male', system: 'general', specialty: '' })
         studentForSale = newStudent
@@ -1304,6 +1678,7 @@ function App() {
       }))
       .filter((item) => item.studentId)
 
+    let committedToServer = false
     if (useBackend) {
       try {
         const reservationItems = cartDetails.items.filter((item) => item.type === 'reservation')
@@ -1338,15 +1713,29 @@ function App() {
             }),
           })
         }
+        committedToServer = true
       } catch (error) {
-        alert(error?.message || 'فشل حفظ العملية على السيرفر')
-        return
+        alert((error?.message || 'فشل حفظ العملية على السيرفر') + ' — تم التحويل لوضع أوفلاين وسيتم رفعها عند عودة الاتصال')
+        setUseBackend(false)
       }
     }
 
     setSalesHistory((prev) => [saleEntry, ...prev])
-    if (!useBackend && newReservations.length) {
+    if (!committedToServer && newReservations.length) {
       setPendingReservations((prev) => [...prev, ...newReservations])
+      for (const reservation of newReservations) {
+        enqueueSync({
+          type: 'reservation_create',
+          localReservationId: reservation.id,
+          payload: {
+            studentId: reservation.studentId,
+            bookId: reservation.bookId,
+            qty: reservation.qty,
+            deposit: reservation.deposit,
+            staffName: selectedStaffId,
+          },
+        })
+      }
     }
     setTransactionCounter((prev) => prev + 1)
     setLastTransaction(saleEntry)
@@ -1424,6 +1813,19 @@ function App() {
           }
           setWalletLog(prev => [logEntry, ...prev])
        }
+       if (!committedToServer) {
+          enqueueSync({
+            type: 'student_balance_set',
+            payload: {
+              studentId: studentForSale.id,
+              balance: nextBalance,
+              studentSnapshot: {
+                ...studentForSale,
+                balance: nextBalance,
+              },
+            },
+          })
+       }
     }
 
     const soldItems = cartDetails.items.filter((item) => item.type !== 'reservation')
@@ -1436,7 +1838,7 @@ function App() {
         .filter(item => item.linkedReservation)
         .map(item => item.linkedReservation.id)
     
-    if (!useBackend && linkedReservations.length > 0) {
+    if (!committedToServer && linkedReservations.length > 0) {
        setPendingReservations(prev => prev.filter(r => !linkedReservations.includes(r.id)))
     }
     
@@ -1450,7 +1852,7 @@ function App() {
        ...reservedItems
     ]
     
-    if (!useBackend && stockDeductItems.length) {
+    if (!committedToServer && stockDeductItems.length) {
       setBooks((prev) =>
         prev.map((book) => {
           const item = stockDeductItems.find((i) => i.id === book.id)
@@ -1464,6 +1866,26 @@ function App() {
           return { ...book, stock: nextStock }
         }),
       )
+    }
+    if (!committedToServer) {
+      const saleItemsForSync = cartDetails.items
+        .filter((item) => item.type !== 'reservation')
+        .map((item) => ({
+          bookId: item.id,
+          qty: item.qty,
+          reservationId: item.linkedReservation?.id || null,
+        }))
+      if (saleItemsForSync.length > 0) {
+        enqueueSync({
+          type: 'transaction_create',
+          payload: {
+            studentId: studentForSale?.id,
+            discount: cartDetails.safeDiscount,
+            staffName: selectedStaffId,
+            items: saleItemsForSync,
+          },
+        })
+      }
     }
     if (useBackend && studentForSale?.id) {
       try {
@@ -1633,6 +2055,15 @@ function App() {
         setReceiptArchiveItems((prev) => [archived, ...prev])
       } catch (error) {
         void error
+        enqueueSync({
+          type: 'receipt_archive',
+          payload: {
+            transactionCode: payload.id,
+            receiptType: payload.receiptType || 'sale',
+            staffName: payload.staffName,
+            payload,
+          },
+        })
       }
     } else {
       try {
@@ -1643,6 +2074,15 @@ function App() {
       } catch (error) {
         void error
       }
+      enqueueSync({
+        type: 'receipt_archive',
+        payload: {
+          transactionCode: payload.id,
+          receiptType: payload.receiptType || 'sale',
+          staffName: payload.staffName,
+          payload,
+        },
+      })
     }
     window.print()
   }
@@ -1821,6 +2261,18 @@ function App() {
               <h2 className="text-2xl font-semibold text-slate-900">{t(`nav.${activeView}`)}</h2>
               <p className="mt-1 text-xs text-slate-400">
                 {t('labels.activeStaff')}: {t(`staff.${selectedStaffId}`)}
+              </p>
+              <p className="mt-1 text-xs">
+                {useBackend ? (
+                  <span className="font-semibold text-emerald-600">
+                    متصل بالسيرفر {syncQueue.length > 0 ? `· مزامنة ${syncQueue.length} عملية` : '· متزامن'}
+                    {isSyncing ? ' ...' : ''}
+                  </span>
+                ) : (
+                  <span className="font-semibold text-amber-600">
+                    يعمل بدون إنترنت · محفوظ محليًا {syncQueue.length > 0 ? `(${syncQueue.length})` : ''}
+                  </span>
+                )}
               </p>
             </div>
             <div className="flex items-center gap-3 rounded-2xl bg-white dark:bg-slate-800 dark:border dark:border-slate-700 px-4 py-3 shadow">
@@ -2396,6 +2848,32 @@ function App() {
                   }
                   */
                   setPendingReservations((prev) => prev.filter((r) => !ids.includes(r.id)))
+                  enqueueSync({
+                    type: 'transaction_create',
+                    payload: {
+                      studentId: student.id,
+                      discount: 0,
+                      staffName: selectedStaffId,
+                      items: reservations.map((r) => ({
+                        bookId: r.bookId,
+                        qty: r.qty || 1,
+                        reservationId: r.id,
+                      })),
+                    },
+                  })
+                  if (student.balance >= subtotal) {
+                    enqueueSync({
+                      type: 'student_balance_set',
+                      payload: {
+                        studentId: student.id,
+                        balance: (student.balance || 0) - subtotal,
+                        studentSnapshot: {
+                          ...student,
+                          balance: (student.balance || 0) - subtotal,
+                        },
+                      },
+                    })
+                  }
                   setActiveView('receipt')
                 }}
               />
@@ -2465,6 +2943,44 @@ function App() {
                           date: new Date().toISOString(),
                         },
                       ])
+                  }
+                  if (refundMethod === 'cash') {
+                    for (const r of reservations) {
+                      enqueueSync({
+                        type: 'reservation_cancel',
+                        payload: {
+                          reservationId: r.id,
+                          refundMethod: 'cash',
+                          refundAmount: r.deposit || 0,
+                          staffName: selectedStaffId,
+                          studentId: student.id,
+                        },
+                      })
+                    }
+                  } else {
+                    for (const r of reservations) {
+                      enqueueSync({
+                        type: 'reservation_cancel',
+                        payload: {
+                          reservationId: r.id,
+                          refundMethod: 'none',
+                          refundAmount: 0,
+                          staffName: selectedStaffId,
+                          studentId: student.id,
+                        },
+                      })
+                    }
+                    enqueueSync({
+                      type: 'student_balance_set',
+                      payload: {
+                        studentId: student.id,
+                        balance: (student.balance || 0) + totalRefund,
+                        studentSnapshot: {
+                          ...student,
+                          balance: (student.balance || 0) + totalRefund,
+                        },
+                      },
+                    })
                   }
 
                   const items = reservations.map((r) => {
