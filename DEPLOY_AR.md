@@ -26,7 +26,7 @@ git push -u origin main
 - أنشئ خدمة Frontend من نفس الريبو بالإعدادات التالية:
   - Root Directory: `pos-frontend`
   - Build Command: `npm ci && npm run build`
-  - Start Command: `npm run preview -- --host 0.0.0.0 --port $PORT`
+  - Start Command: `npx serve -s dist -l $PORT`
   - متغيرات البيئة:
     - `VITE_API_BASE_URL=https://<backend-domain>.up.railway.app`
 
@@ -45,6 +45,8 @@ git push -u origin main
 - الحذف للطلاب والكتب معطّل على الباكند لحماية البيانات.
 - عند SQLite محليًا يتم أخذ نسخة احتياطية تلقائية.
 - في الإنتاج على Railway يتم استخدام PostgreSQL عبر `DATABASE_URL`.
+- خدمة الباكند على Railway لن تعمل بدون `DATABASE_URL`.
+- بناء الواجهة في الإنتاج سيفشل إذا لم يتم تعريف `VITE_API_BASE_URL`.
 
 ## 6) ملفات مضافة لتسهيل Railway
 - [Procfile](file:///e:/شغل/شغل/project/Procfile) لخدمة الباكند.

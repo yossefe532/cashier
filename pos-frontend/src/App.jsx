@@ -279,6 +279,9 @@ const readJsonStorage = (key, fallbackValue) => {
 
 const apiBaseUrl = (() => {
   const raw = import.meta.env.VITE_API_BASE_URL
+  if (import.meta.env.PROD && !(typeof raw === 'string' && raw.trim())) {
+    throw new Error('VITE_API_BASE_URL is required in production')
+  }
   if (typeof raw === 'string' && raw.trim()) return raw.trim().replace(/\/+$/, '')
   return 'http://localhost:8000'
 })()

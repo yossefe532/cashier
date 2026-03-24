@@ -2,6 +2,9 @@ import os
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker, declarative_base
 
+if os.getenv("RAILWAY_ENVIRONMENT") and not os.getenv("DATABASE_URL"):
+    raise RuntimeError("DATABASE_URL is required on Railway")
+
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./app.db")
 if DATABASE_URL.startswith("postgres://"):
     DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql+psycopg://", 1)
