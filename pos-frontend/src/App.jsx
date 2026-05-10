@@ -27,6 +27,25 @@ import {
 import { useTranslation } from 'react-i18next'
 import * as XLSX from 'xlsx'
 import { validateBookDraft } from './posLogic'
+import LoginPage from './LoginPage'
+import { createApiRequest } from './services/apiClient'
+import { hydrateCoreData, fetchBooksInsights, fetchCoreSnapshot } from './modules/catalog/coreDataService'
+import {
+  createFindServerBookId,
+  createFindServerStudentId,
+  enqueueSyncOperation,
+  processSyncQueueOnce,
+} from './modules/sync/syncManager'
+import { archiveReceiptPayload, refreshReceiptArchiveItems } from './modules/receipt/receiptArchiveService'
+import { createSupplyRecord, refreshAccountingSnapshot } from './modules/accounting/accountingService'
+import {
+  AuthSessionError,
+  clearAuthState,
+  currentAuthUser,
+  loadAuthState,
+  login,
+  logout,
+} from './authSession'
 
 const logoUrl = 'https://i.postimg.cc/hPWCrLY4/educon_logo_high_quality_png_white.png'
 
@@ -140,6 +159,24 @@ const navItems = [
   { id: 'accounting', icon: FileSpreadsheet },
   { id: 'reports', icon: BarChart3 },
 ]
+
+const rolePriority = { viewer: 1, cashier: 2, manager: 3, admin: 4 }
+const viewAccessLevel = {
+  pos: 'cashier',
+  books: 'manager',
+  booksInsights: 'manager',
+  students: 'cashier',
+  pickupReservation: 'cashier',
+  cancelReservation: 'cashier',
+  returns: 'cashier',
+  receipt: 'cashier',
+  receiptArchive: 'manager',
+  emergency: 'manager',
+  inventory: 'manager',
+  admin: 'admin',
+  accounting: 'manager',
+  reports: 'manager',
+}
 
 const defaultWhatsappGroupLinks = {
   general: {
@@ -286,26 +323,7 @@ const apiBaseUrl = (() => {
   return 'http://localhost:8000'
 })()
 
-async function apiRequest(path, options) {
-  const response = await fetch(`${apiBaseUrl}${path}`, {
-    headers: { 'content-type': 'application/json', ...(options?.headers || {}) },
-    ...options,
-  })
-  if (!response.ok) {
-    let detail = ''
-    try {
-      const data = await response.json()
-      if (data?.detail) detail = String(data.detail)
-    } catch (error) {
-      void error
-    }
-    const error = new Error(detail || `Request failed: ${response.status}`)
-    error.status = response.status
-    throw error
-  }
-  if (response.status === 204) return null
-  return response.json()
-}
+const isAuthError = (error) => error instanceof AuthSessionError || Boolean(error?.authExpired)
 
 const gradeFromStage = (stage) => {
   if (stage === 'first') return '1st Sec'
@@ -430,6 +448,20 @@ const getDefaultReservationDeposit = (book) => {
 function App() {
   const { t, i18n } = useTranslation()
   const storedSnapshot = useMemo(() => readStoredSnapshot(), [])
+  const [authState, setAuthState] = useState(() => loadAuthState())
+  const [authLoading, setAuthLoading] = useState(false)
+  const [authError, setAuthError] = useState('')
+  const authUser = authState?.user || currentAuthUser()
+  const activeRole = authUser?.roles?.[0] || 'viewer'
+
+  const canAccessView = useCallback(
+    (viewId) => {
+      const minimum = viewAccessLevel[viewId] || 'viewer'
+      return (rolePriority[activeRole] || 0) >= (rolePriority[minimum] || 0)
+    },
+    [activeRole],
+  )
+
   const [useBackend, setUseBackend] = useState(() =>
     typeof storedSnapshot?.useBackend === 'boolean' ? storedSnapshot.useBackend : true,
   )
@@ -570,6 +602,42 @@ function App() {
 
   const isRtl = i18n.language === 'ar'
   const locale = isRtl ? 'ar-EG' : 'en-US'
+  const apiRequest = useMemo(() => createApiRequest(apiBaseUrl), [])
+
+  const handleSessionExpired = useCallback(() => {
+    clearAuthState()
+    setAuthState(null)
+    setAuthError('Your session has expired. Please sign in again.')
+  }, [])
+
+  const handleLogin = useCallback(async ({ username, password }) => {
+    setAuthLoading(true)
+    setAuthError('')
+    try {
+      const next = await login(apiBaseUrl, username, password)
+      setAuthState(next)
+    } catch (error) {
+      setAuthError(error?.message || 'Login failed')
+    } finally {
+      setAuthLoading(false)
+    }
+  }, [])
+
+  const handleLogout = useCallback(async () => {
+    await logout(apiBaseUrl)
+    setAuthState(null)
+  }, [])
+
+  const availableNavItems = useMemo(() => {
+    return navItems.filter((item) => canAccessView(item.id)).filter((item) => item.id !== 'receipt' || lastTransaction)
+  }, [canAccessView, lastTransaction])
+
+  useEffect(() => {
+    if (!availableNavItems.some((item) => item.id === activeView)) {
+      const fallback = availableNavItems[0]?.id || 'pos'
+      setActiveView(fallback)
+    }
+  }, [activeView, availableNavItems])
 
   useEffect(() => {
     document.body.setAttribute('dir', isRtl ? 'rtl' : 'ltr')
@@ -673,255 +741,60 @@ function App() {
   }, [syncMap])
 
   const enqueueSync = useCallback((operation) => {
-    setSyncQueue((prev) => [
-      ...prev,
-      {
-        id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
-        createdAt: new Date().toISOString(),
-        ...operation,
-      },
-    ])
+    enqueueSyncOperation(setSyncQueue, operation)
   }, [])
 
-  const findServerStudentId = useCallback(
-    async (localStudentId) => {
-      if (localStudentId == null) return null
-      const asKey = String(localStudentId)
-      const mapped = syncMap.students?.[asKey]
-      if (mapped) return mapped
-      const localStudent = students.find((s) => String(s.id) === asKey)
-      if (!localStudent) return Number(localStudentId)
-      const serverStudents = await apiRequest('/students')
-      const exact = Array.isArray(serverStudents)
-        ? serverStudents.find(
-            (s) =>
-              (localStudent.phone && s.phone && s.phone === localStudent.phone) ||
-              s.name?.trim().toLowerCase() === localStudent.name?.trim().toLowerCase(),
-          )
-        : null
-      if (exact?.id != null) {
-        const serverId = Number(exact.id)
-        setSyncMap((prev) => ({
-          ...prev,
-          students: { ...(prev.students || {}), [asKey]: serverId },
-        }))
-        return serverId
-      }
-      const created = await apiRequest('/students', {
-        method: 'POST',
-        body: JSON.stringify(
-          mapUiStudentToApi({
-            ...localStudent,
-            balance: Number(localStudent.balance) || 0,
-          }),
-        ),
-      })
-      const serverId = Number(created.id)
-      setSyncMap((prev) => ({
-        ...prev,
-        students: { ...(prev.students || {}), [asKey]: serverId },
-      }))
-      return serverId
-    },
-    [students, syncMap.students],
+  const findServerStudentId = useMemo(
+    () =>
+      createFindServerStudentId({
+        syncMap,
+        students,
+        setSyncMap,
+        apiRequest,
+        mapUiStudentToApi,
+      }),
+    [syncMap, students, setSyncMap, apiRequest],
   )
 
-  const findServerBookId = useCallback(
-    async (localBookId) => {
-      if (localBookId == null) return null
-      const asKey = String(localBookId)
-      const mapped = syncMap.books?.[asKey]
-      if (mapped) return mapped
-      const localBook = books.find((b) => String(b.id) === asKey)
-      if (!localBook) return Number(localBookId)
-      const serverBooks = await apiRequest('/books')
-      const exact = Array.isArray(serverBooks)
-        ? serverBooks.find(
-            (b) =>
-              (localBook.barcode && b.isbn_barcode && b.isbn_barcode === localBook.barcode) ||
-              (b.title?.trim().toLowerCase() === localBook.title?.trim().toLowerCase() &&
-                b.author?.trim().toLowerCase() === localBook.author?.trim().toLowerCase()),
-          )
-        : null
-      if (exact?.id != null) {
-        const serverId = Number(exact.id)
-        setSyncMap((prev) => ({
-          ...prev,
-          books: { ...(prev.books || {}), [asKey]: serverId },
-        }))
-        return serverId
-      }
-      const created = await apiRequest('/books', {
-        method: 'POST',
-        body: JSON.stringify(
-          mapUiBookToApi({
-            ...localBook,
-            reservedStock: Number(localBook.reservedStock) || 0,
-          }),
-        ),
-      })
-      const serverId = Number(created.id)
-      setSyncMap((prev) => ({
-        ...prev,
-        books: { ...(prev.books || {}), [asKey]: serverId },
-      }))
-      return serverId
-    },
-    [books, syncMap.books],
+  const findServerBookId = useMemo(
+    () =>
+      createFindServerBookId({
+        syncMap,
+        books,
+        setSyncMap,
+        apiRequest,
+        mapUiBookToApi,
+      }),
+    [syncMap, books, setSyncMap, apiRequest],
   )
 
   const processSyncQueue = useCallback(async () => {
-    if (!useBackend || syncInFlightRef.current || syncQueue.length === 0) return
-    syncInFlightRef.current = true
-    setIsSyncing(true)
-    let remaining = [...syncQueue]
-    try {
-      while (remaining.length > 0) {
-        const op = remaining[0]
-        if (op.type === 'book_upsert') {
-          const payload = op.payload
-          if (op.mode === 'edit') {
-            const serverBookId = await findServerBookId(op.localId)
-            await apiRequest(`/books/${serverBookId}`, {
-              method: 'PUT',
-              body: JSON.stringify(mapUiBookToApi({ ...payload, reservedStock: payload.reservedStock ?? 0 })),
-            })
-          } else {
-            await findServerBookId(op.localId)
-          }
-        } else if (op.type === 'student_upsert') {
-          const payload = op.payload
-          if (op.mode === 'edit') {
-            const serverStudentId = await findServerStudentId(op.localId)
-            await apiRequest(`/students/${serverStudentId}`, {
-              method: 'PUT',
-              body: JSON.stringify(mapUiStudentToApi({ ...payload, balance: payload.balance ?? 0 })),
-            })
-          } else {
-            await findServerStudentId(op.localId)
-          }
-        } else if (op.type === 'reservation_create') {
-          const serverStudentId = await findServerStudentId(op.payload.studentId)
-          const serverBookId = await findServerBookId(op.payload.bookId)
-          const created = await apiRequest('/reservations', {
-            method: 'POST',
-            body: JSON.stringify({
-              student_id: serverStudentId,
-              book_id: serverBookId,
-              quantity: op.payload.qty,
-              deposit_amount: op.payload.deposit || 0,
-              staff_name: op.payload.staffName,
-            }),
-          })
-          if (op.localReservationId != null && created?.id != null) {
-            setSyncMap((prev) => ({
-              ...prev,
-              reservations: {
-                ...(prev.reservations || {}),
-                [String(op.localReservationId)]: Number(created.id),
-              },
-            }))
-          }
-        } else if (op.type === 'transaction_create') {
-          const serverStudentId = await findServerStudentId(op.payload.studentId)
-          const items = []
-          for (const item of op.payload.items || []) {
-            const serverBookId = await findServerBookId(item.bookId)
-            let reservationId = null
-            if (item.reservationId != null) {
-              reservationId = syncMap.reservations?.[String(item.reservationId)] || null
-            }
-            items.push({
-              book_id: serverBookId,
-              quantity: item.qty,
-              reservation_id: reservationId,
-            })
-          }
-          if (items.length > 0) {
-            await apiRequest('/transactions', {
-              method: 'POST',
-              body: JSON.stringify({
-                student_id: serverStudentId,
-                discount: op.payload.discount || 0,
-                staff_name: op.payload.staffName,
-                items,
-              }),
-            })
-          }
-        } else if (op.type === 'student_balance_set') {
-          const serverStudentId = await findServerStudentId(op.payload.studentId)
-          await apiRequest(`/students/${serverStudentId}`, {
-            method: 'PUT',
-            body: JSON.stringify(
-              mapUiStudentToApi({
-                ...op.payload.studentSnapshot,
-                balance: op.payload.balance,
-              }),
-            ),
-          })
-        } else if (op.type === 'reservation_cancel') {
-          const localId = String(op.payload.reservationId)
-          const serverReservationId = syncMap.reservations?.[localId] || op.payload.reservationId
-          await apiRequest(`/reservations/${serverReservationId}`, { method: 'DELETE' })
-          if (op.payload.refundMethod === 'cash' && op.payload.refundAmount > 0) {
-            await apiRequest('/safe/emergency-withdrawals', {
-              method: 'POST',
-              body: JSON.stringify({
-                amount: op.payload.refundAmount,
-                reason: 'Refund cancelled reservation',
-                staff_name: op.payload.staffName,
-              }),
-            })
-          }
-          if (op.payload.refundMethod === 'wallet') {
-            const serverStudentId = await findServerStudentId(op.payload.studentId)
-            await apiRequest(`/students/${serverStudentId}`, {
-              method: 'PUT',
-              body: JSON.stringify(
-                mapUiStudentToApi({
-                  ...op.payload.studentSnapshot,
-                  balance: op.payload.nextBalance,
-                }),
-              ),
-            })
-          }
-        } else if (op.type === 'emergency_withdrawal') {
-          await apiRequest('/safe/emergency-withdrawals', {
-            method: 'POST',
-            body: JSON.stringify({
-              amount: op.payload.amount,
-              reason: op.payload.reason || null,
-              staff_name: op.payload.staffName,
-            }),
-          })
-        } else if (op.type === 'receipt_archive') {
-          await apiRequest('/receipt-archive', {
-            method: 'POST',
-            body: JSON.stringify({
-              transaction_code: op.payload.transactionCode || null,
-              receipt_type: op.payload.receiptType,
-              staff_name: op.payload.staffName || null,
-              payload: op.payload.payload,
-            }),
-          })
-        }
-        remaining.shift()
-        setSyncQueue([...remaining])
-      }
-    } catch (error) {
-      void error
-    } finally {
-      syncInFlightRef.current = false
-      setIsSyncing(false)
-    }
-  }, [findServerBookId, findServerStudentId, syncMap.reservations, syncQueue, useBackend])
+    await processSyncQueueOnce({
+      authUser,
+      useBackend,
+      syncInFlightRef,
+      setIsSyncing,
+      syncQueue,
+      setSyncQueue,
+      apiRequest,
+      findServerBookId,
+      findServerStudentId,
+      syncMapReservations: syncMap.reservations,
+      setSyncMap,
+      mapUiBookToApi,
+      mapUiStudentToApi,
+      isAuthError,
+      handleSessionExpired,
+    })
+  }, [authUser, useBackend, syncQueue, apiRequest, findServerBookId, findServerStudentId, syncMap.reservations, handleSessionExpired])
 
   useEffect(() => {
-    if (!useBackend || syncQueue.length === 0) return
+    if (!authUser || !useBackend || syncQueue.length === 0) return
     processSyncQueue()
-  }, [useBackend, syncQueue, processSyncQueue])
+  }, [authUser, useBackend, syncQueue, processSyncQueue])
 
   useEffect(() => {
+    if (!authUser) return
     if (useBackend) return
     let mounted = true
     let timer = null
@@ -941,79 +814,35 @@ function App() {
       mounted = false
       if (timer) clearTimeout(timer)
     }
-  }, [useBackend])
+  }, [authUser, useBackend])
 
   useEffect(() => {
+    if (!authUser) return
     if (!useBackend) return
     let cancelled = false
     const run = async () => {
       try {
-        let apiBooks = await apiRequest('/books')
-        let apiStudents = await apiRequest('/students')
-
-        if (Array.isArray(apiBooks) && apiBooks.length === 0 && Array.isArray(storedSnapshot?.books) && storedSnapshot.books.length) {
-          for (const b of storedSnapshot.books) {
-            const draft = {
-              title: b.title,
-              author: b.author,
-              sellingPrice: b.sellingPrice,
-              costPrice: b.costPrice,
-              stock: b.stock,
-              barcode: b.barcode,
-              isArriving: b.isArriving,
-            }
-            await apiRequest('/books', { method: 'POST', body: JSON.stringify(mapUiBookToApi(draft)) })
-          }
-          apiBooks = await apiRequest('/books')
-        }
-
-        if (Array.isArray(apiStudents) && apiStudents.length === 0 && Array.isArray(storedSnapshot?.students) && storedSnapshot.students.length) {
-          for (const s of storedSnapshot.students) {
-            const draft = {
-              name: s.name,
-              phone: s.phone,
-              stage: s.stage,
-              gender: s.gender,
-              system: s.system,
-              specialty: s.specialty,
-              balance: s.balance,
-            }
-            await apiRequest('/students', { method: 'POST', body: JSON.stringify(mapUiStudentToApi(draft)) })
-          }
-          apiStudents = await apiRequest('/students')
-        }
-
-        const uiBooks = Array.isArray(apiBooks) ? apiBooks.map(mapApiBookToUi) : []
-        const uiStudents = Array.isArray(apiStudents) ? apiStudents.map(mapApiStudentToUi) : []
-
-        const apiReservations = await apiRequest('/reservations')
-        const bookById = new Map(uiBooks.map((b) => [b.id, b]))
-        const pending = Array.isArray(apiReservations)
-          ? apiReservations
-              .filter((r) => r.status === 'pending')
-              .map((r) => {
-                const book = bookById.get(r.book_id)
-                return {
-                  id: r.id,
-                  transactionId: r.transaction_id ?? null,
-                  studentId: r.student_id,
-                  bookId: r.book_id,
-                  qty: r.quantity || 1,
-                  status: r.status,
-                  deposit: r.deposit_amount || 0,
-                  pendingArrival: Boolean(book?.isArriving),
-                  date: r.created_at,
-                }
-              })
-          : []
+        const { uiBooks, uiStudents, pending } = await hydrateCoreData({
+          apiRequest,
+          storedBooks: storedSnapshot?.books,
+          storedStudents: storedSnapshot?.students,
+          mapUiBookToApi,
+          mapUiStudentToApi,
+          mapApiBookToUi,
+          mapApiStudentToUi,
+        })
 
         if (cancelled) return
         setBooks(uiBooks)
         setStudents(uiStudents)
         setPendingReservations(pending)
         setSelectedStudentId((prev) => (uiStudents.some((s) => String(s.id) === String(prev)) ? prev : ''))
-      } catch {
+      } catch (error) {
         if (cancelled) return
+        if (isAuthError(error)) {
+          handleSessionExpired()
+          return
+        }
         setUseBackend(false)
       }
     }
@@ -1021,7 +850,7 @@ function App() {
     return () => {
       cancelled = true
     }
-  }, [useBackend, storedSnapshot])
+  }, [authUser, useBackend, storedSnapshot, handleSessionExpired, apiRequest])
 
   useEffect(() => {
     if (isDarkMode) document.documentElement.classList.add('dark')
@@ -1035,14 +864,15 @@ function App() {
   }, [activeView])
 
   useEffect(() => {
+    if (!authUser) return
     if (!useBackend) return
     if (activeView !== 'receiptArchive') return
     let cancelled = false
     const run = async () => {
       try {
-        const data = await apiRequest('/receipt-archive')
+        const data = await refreshReceiptArchiveItems(apiRequest)
         if (cancelled) return
-        setReceiptArchiveItems(Array.isArray(data) ? data : [])
+        setReceiptArchiveItems(data)
       } catch {
         if (cancelled) return
         setReceiptArchiveItems([])
@@ -1052,28 +882,16 @@ function App() {
     return () => {
       cancelled = true
     }
-  }, [useBackend, activeView])
+  }, [authUser, useBackend, activeView, apiRequest])
 
   useEffect(() => {
+    if (!authUser) return
     if (!useBackend) return
     if (activeView !== 'booksInsights') return
     let cancelled = false
     const run = async () => {
       try {
-        const stats = await apiRequest('/reports/books')
-        const rows = Array.isArray(stats) ? stats : []
-        const byId = new Map(rows.map((r) => [r.book_id, r]))
-        const merged = books.map((b) => {
-          const s = byId.get(b.id)
-          return {
-            book: b,
-            soldQty: Number(s?.sold_qty) || 0,
-            reservedQty: Number(s?.pending_reserved_qty) || 0,
-            reservedStock: Number(b.reservedStock) || 0,
-            availableToSell: Math.max((Number(b.stock) || 0) - (Number(b.reservedStock) || 0), 0),
-          }
-        })
-        merged.sort((a, b) => b.soldQty - a.soldQty)
+        const merged = await fetchBooksInsights(apiRequest, books)
         if (cancelled) return
         setBooksInsightsRows(merged)
       } catch {
@@ -1085,21 +903,19 @@ function App() {
     return () => {
       cancelled = true
     }
-  }, [useBackend, activeView, books])
+  }, [authUser, useBackend, activeView, books, apiRequest])
 
   useEffect(() => {
+    if (!authUser) return
     if (!useBackend) return
     if (activeView !== 'accounting') return
     let cancelled = false
     const run = async () => {
       try {
-        const [finance, suppliesList] = await Promise.all([
-          apiRequest('/reports/finance'),
-          apiRequest('/supplies'),
-        ])
+        const { finance, supplies: suppliesList } = await refreshAccountingSnapshot(apiRequest)
         if (cancelled) return
-        setFinanceReport(finance || null)
-        setSupplies(Array.isArray(suppliesList) ? suppliesList : [])
+        setFinanceReport(finance)
+        setSupplies(suppliesList)
       } catch {
         if (cancelled) return
         setFinanceReport(null)
@@ -1110,7 +926,7 @@ function App() {
     return () => {
       cancelled = true
     }
-  }, [useBackend, activeView])
+  }, [authUser, useBackend, activeView, apiRequest])
 
   const stageOptions = [
     { value: 'first', label: t('stages.first') },
@@ -1718,6 +1534,10 @@ function App() {
         }
         committedToServer = true
       } catch (error) {
+        if (isAuthError(error)) {
+          handleSessionExpired()
+          return
+        }
         alert((error?.message || 'فشل حفظ العملية على السيرفر') + ' — تم التحويل لوضع أوفلاين وسيتم رفعها عند عودة الاتصال')
         setUseBackend(false)
       }
@@ -1898,30 +1718,11 @@ function App() {
             body: JSON.stringify(mapUiStudentToApi({ ...studentForSale, balance: nextBalance })),
           })
         }
-        const apiBooks = await apiRequest('/books')
-        const apiStudents = await apiRequest('/students')
-        const apiReservations = await apiRequest('/reservations')
-        const uiBooks = Array.isArray(apiBooks) ? apiBooks.map(mapApiBookToUi) : []
-        const uiStudents = Array.isArray(apiStudents) ? apiStudents.map(mapApiStudentToUi) : []
-        const bookById = new Map(uiBooks.map((b) => [b.id, b]))
-        const pending = Array.isArray(apiReservations)
-          ? apiReservations
-              .filter((r) => r.status === 'pending')
-              .map((r) => {
-                const book = bookById.get(r.book_id)
-                return {
-                  id: r.id,
-                  transactionId: null,
-                  studentId: r.student_id,
-                  bookId: r.book_id,
-                  qty: r.quantity || 1,
-                  status: r.status,
-                  deposit: r.deposit_amount || 0,
-                  pendingArrival: Boolean(book?.isArriving),
-                  date: r.created_at,
-                }
-              })
-          : []
+        const { uiBooks, uiStudents, pending } = await fetchCoreSnapshot({
+          apiRequest,
+          mapApiBookToUi,
+          mapApiStudentToUi,
+        })
         setBooks(uiBooks)
         setStudents(uiStudents)
         setPendingReservations(pending)
@@ -2046,15 +1847,7 @@ function App() {
     }
     if (useBackend) {
       try {
-        const archived = await apiRequest('/receipt-archive', {
-          method: 'POST',
-          body: JSON.stringify({
-            transaction_code: payload.id,
-            receipt_type: payload.receiptType || 'sale',
-            staff_name: payload.staffName,
-            payload,
-          }),
-        })
+        const archived = await archiveReceiptPayload({ apiRequest, payload })
         setReceiptArchiveItems((prev) => [archived, ...prev])
       } catch (error) {
         void error
@@ -2153,6 +1946,10 @@ function App() {
     setPendingReservations([])
   }
 
+  if (!authUser) {
+    return <LoginPage onLogin={handleLogin} loading={authLoading} error={authError} />
+  }
+
   return (
     <div className={`min-h-screen ${isRtl ? 'rtl' : 'ltr'} ${isDarkMode ? 'dark' : ''} bg-slate-50 dark:bg-slate-950`}>
       <style>{`
@@ -2196,9 +1993,7 @@ function App() {
           </div>
 
           <nav className="mt-10 space-y-2">
-            {navItems
-              .filter((item) => item.id !== 'receipt' || lastTransaction)
-              .map((item) => {
+            {availableNavItems.map((item) => {
               const Icon = item.icon
               const isActive = activeView === item.id
               return (
@@ -2219,6 +2014,9 @@ function App() {
 
           <div className="mt-10 rounded-2xl bg-white/10 px-4 py-4">
             <p className="text-xs uppercase tracking-[0.2em] text-white/60">{t('labels.staff')}</p>
+            <p className="mt-1 text-xs text-white/70">
+              {authUser?.full_name || authUser?.username} · {activeRole}
+            </p>
             <select
               value={selectedStaffId}
               onChange={(event) => setSelectedStaffId(event.target.value)}
@@ -2233,6 +2031,16 @@ function App() {
           </div>
 
           <div className="mt-auto space-y-2 pt-10">
+            <button
+              type="button"
+              onClick={handleLogout}
+              className="flex w-full items-center justify-between rounded-2xl border border-white/20 bg-white/10 px-4 py-3 text-sm font-semibold"
+            >
+              <span className="flex items-center gap-2">
+                <Lock className="h-4 w-4" />
+                Logout
+              </span>
+            </button>
             <button
               type="button"
               onClick={() => setIsDarkMode((d) => !d)}
@@ -3117,8 +2925,8 @@ function App() {
               onRefresh={async () => {
                 if (!useBackend) return
                 try {
-                  const data = await apiRequest('/receipt-archive')
-                  setReceiptArchiveItems(Array.isArray(data) ? data : [])
+                  const data = await refreshReceiptArchiveItems(apiRequest)
+                  setReceiptArchiveItems(data)
                 } catch {
                   setReceiptArchiveItems([])
                 }
@@ -3141,12 +2949,9 @@ function App() {
               onRefresh={async () => {
                 if (!useBackend) return
                 try {
-                  const [finance, suppliesList] = await Promise.all([
-                    apiRequest('/reports/finance'),
-                    apiRequest('/supplies'),
-                  ])
-                  setFinanceReport(finance || null)
-                  setSupplies(Array.isArray(suppliesList) ? suppliesList : [])
+                  const { finance, supplies: suppliesList } = await refreshAccountingSnapshot(apiRequest)
+                  setFinanceReport(finance)
+                  setSupplies(suppliesList)
                 } catch {
                   setFinanceReport(null)
                   setSupplies([])
@@ -3160,26 +2965,27 @@ function App() {
                 const paid = supplyForm.paid === '' ? 0 : Number(supplyForm.paid)
                 if (!bookId || quantity <= 0 || Number.isNaN(quantity) || Number.isNaN(unitCost)) return
                 try {
-                  await apiRequest('/supplies', {
-                    method: 'POST',
-                    body: JSON.stringify({
-                      book_id: bookId,
-                      quantity,
-                      unit_cost: unitCost,
-                      paid_amount: paid,
-                      supplier_name: supplyForm.supplier || null,
-                      staff_name: selectedStaffId,
-                    }),
+                  await createSupplyRecord({
+                    apiRequest,
+                    bookId,
+                    quantity,
+                    unitCost,
+                    paidAmount: paid,
+                    supplierName: supplyForm.supplier || null,
+                    staffName: selectedStaffId,
                   })
                   setSupplyForm({ bookId: '', qty: '1', unitCost: '', paid: '', supplier: '' })
-                  const apiBooks = await apiRequest('/books')
-                  setBooks(Array.isArray(apiBooks) ? apiBooks.map(mapApiBookToUi) : [])
-                  const [finance, suppliesList] = await Promise.all([
-                    apiRequest('/reports/finance'),
-                    apiRequest('/supplies'),
+                  const [{ uiBooks }, { finance, supplies: suppliesList }] = await Promise.all([
+                    fetchCoreSnapshot({
+                      apiRequest,
+                      mapApiBookToUi,
+                      mapApiStudentToUi,
+                    }),
+                    refreshAccountingSnapshot(apiRequest),
                   ])
-                  setFinanceReport(finance || null)
-                  setSupplies(Array.isArray(suppliesList) ? suppliesList : [])
+                  setBooks(uiBooks)
+                  setFinanceReport(finance)
+                  setSupplies(suppliesList)
                 } catch (error) {
                   alert(error?.message || 'فشل تسجيل التوريد')
                 }

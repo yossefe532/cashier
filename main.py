@@ -1,15 +1,13 @@
-from fastapi import FastAPI, Depends, HTTPException, status
+import logging
+from fastapi import FastAPI, Depends, HTTPException, Request, status
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from sqlalchemy.orm import Session
 from sqlalchemy import func
 import json
-import shutil
-from pathlib import Path
-from datetime import datetime
 
 from database import SessionLocal, engine
 from models import (
-    Base,
     Book,
     Student,
     Transaction,
@@ -20,6 +18,7 @@ from models import (
     InventorySession,
     Supply,
     ReceiptArchive,
+    User,
 )
 from schemas import (
     BookCreate,
@@ -46,49 +45,58 @@ from schemas import (
     FinanceReportOut,
     BookStatsOut,
 )
+from auth.config import get_auth_config
+from auth.dependencies import require_roles
+from auth.router import router as auth_router
+from auth.service import ensure_roles_and_admin
+from app.db.schema_guard import assert_schema_is_current
 
-Base.metadata.create_all(bind=engine)
+logger = logging.getLogger("pos_api")
+auth_config = get_auth_config()
 
-is_sqlite = engine.dialect.name == "sqlite"
-db_file = Path("app.db")
-if is_sqlite and db_file.exists():
-    backup_dir = Path("db_backups")
-    backup_dir.mkdir(parents=True, exist_ok=True)
-    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-    backup_file = backup_dir / f"app-{stamp}.db"
-    shutil.copy2(db_file, backup_file)
-
-def _ensure_column(table: str, column: str, ddl: str):
-    with engine.begin() as conn:
-        cols = conn.exec_driver_sql(f"PRAGMA table_info({table})").fetchall()
-        existing = {row[1] for row in cols}
-        if column in existing:
-            return
-        conn.exec_driver_sql(f"ALTER TABLE {table} ADD COLUMN {ddl}")
-
-
-if is_sqlite:
-    _ensure_column("students", "balance", "balance REAL NOT NULL DEFAULT 0")
-    _ensure_column("reservations", "quantity", "quantity INTEGER NOT NULL DEFAULT 1")
-    _ensure_column("transaction_items", "cost_at_sale", "cost_at_sale REAL NOT NULL DEFAULT 0")
-    _ensure_column("books", "estimated_cost_price", "estimated_cost_price REAL")
-    _ensure_column("books", "estimated_selling_price", "estimated_selling_price REAL")
-
-    with engine.begin() as conn:
-        conn.exec_driver_sql(
-            "UPDATE transaction_items SET cost_at_sale = (SELECT cost_price FROM books WHERE books.id = transaction_items.book_id) "
-            "WHERE cost_at_sale = 0"
-        )
+assert_schema_is_current(engine)
+with SessionLocal() as bootstrap_db:
+    ensure_roles_and_admin(bootstrap_db)
 
 app = FastAPI(title="Educon POS API")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=auth_config.cors_allowed_origins,
     allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+    allow_headers=["Authorization", "Content-Type"],
 )
+app.include_router(auth_router)
+
+
+@app.exception_handler(HTTPException)
+async def http_exception_handler(request: Request, exc: HTTPException):
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={
+            "detail": exc.detail,
+            "error": {
+                "code": f"http_{exc.status_code}",
+                "path": request.url.path,
+            },
+        },
+    )
+
+
+@app.exception_handler(Exception)
+async def unhandled_exception_handler(request: Request, exc: Exception):
+    logger.exception("unhandled_exception path=%s", request.url.path)
+    return JSONResponse(
+        status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        content={
+            "detail": "Internal server error",
+            "error": {
+                "code": "internal_error",
+                "path": request.url.path,
+            },
+        },
+    )
 
 
 def get_db():
@@ -115,12 +123,21 @@ def validate_book_stock(total_stock: int, reserved_stock: int, is_arriving: bool
 
 
 @app.get("/books", response_model=list[BookOut])
-def list_books(skip: int = 0, limit: int = 100, db: Session = Depends(get_db)):
+def list_books(
+    skip: int = 0,
+    limit: int = 100,
+    db: Session = Depends(get_db),
+    _: User = Depends(require_roles("viewer", "cashier", "manager", "admin")),
+):
     return db.query(Book).offset(skip).limit(limit).all()
 
 
 @app.get("/books/{book_id}", response_model=BookOut)
-def get_book(book_id: int, db: Session = Depends(get_db)):
+def get_book(
+    book_id: int,
+    db: Session = Depends(get_db),
+    _: User = Depends(require_roles("viewer", "cashier", "manager", "admin")),
+):
     book = db.query(Book).filter(Book.id == book_id).first()
     if not book:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Book not found")
@@ -128,7 +145,11 @@ def get_book(book_id: int, db: Session = Depends(get_db)):
 
 
 @app.post("/books", response_model=BookOut, status_code=status.HTTP_201_CREATED)
-def create_book(payload: BookCreate, db: Session = Depends(get_db)):
+def create_book(
+    payload: BookCreate,
+    db: Session = Depends(get_db),
+    _: User = Depends(require_roles("manager", "admin")),
+):
     if payload.cost_price < 0 or payload.selling_price < 0:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid price values")
     if payload.estimated_cost_price is not None and payload.estimated_cost_price < 0:
@@ -144,7 +165,12 @@ def create_book(payload: BookCreate, db: Session = Depends(get_db)):
 
 
 @app.put("/books/{book_id}", response_model=BookOut)
-def update_book(book_id: int, payload: BookUpdate, db: Session = Depends(get_db)):
+def update_book(
+    book_id: int,
+    payload: BookUpdate,
+    db: Session = Depends(get_db),
+    _: User = Depends(require_roles("manager", "admin")),
+):
     book = db.query(Book).filter(Book.id == book_id).first()
     if not book:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Book not found")
@@ -170,17 +196,30 @@ def update_book(book_id: int, payload: BookUpdate, db: Session = Depends(get_db)
 
 
 @app.delete("/books/{book_id}", status_code=status.HTTP_204_NO_CONTENT)
-def delete_book(book_id: int, db: Session = Depends(get_db)):
+def delete_book(
+    book_id: int,
+    db: Session = Depends(get_db),
+    _: User = Depends(require_roles("admin")),
+):
     raise HTTPException(status_code=status.HTTP_405_METHOD_NOT_ALLOWED, detail="Deleting books is disabled to protect production data")
 
 
 @app.get("/students", response_model=list[StudentOut])
-def list_students(skip: int = 0, limit: int = 100, db: Session = Depends(get_db)):
+def list_students(
+    skip: int = 0,
+    limit: int = 100,
+    db: Session = Depends(get_db),
+    _: User = Depends(require_roles("viewer", "cashier", "manager", "admin")),
+):
     return db.query(Student).offset(skip).limit(limit).all()
 
 
 @app.get("/students/{student_id}", response_model=StudentOut)
-def get_student(student_id: int, db: Session = Depends(get_db)):
+def get_student(
+    student_id: int,
+    db: Session = Depends(get_db),
+    _: User = Depends(require_roles("viewer", "cashier", "manager", "admin")),
+):
     student = db.query(Student).filter(Student.id == student_id).first()
     if not student:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Student not found")
@@ -188,7 +227,11 @@ def get_student(student_id: int, db: Session = Depends(get_db)):
 
 
 @app.post("/students", response_model=StudentOut, status_code=status.HTTP_201_CREATED)
-def create_student(payload: StudentCreate, db: Session = Depends(get_db)):
+def create_student(
+    payload: StudentCreate,
+    db: Session = Depends(get_db),
+    _: User = Depends(require_roles("cashier", "manager", "admin")),
+):
     student = Student(**payload.model_dump())
     db.add(student)
     db.commit()
@@ -197,7 +240,12 @@ def create_student(payload: StudentCreate, db: Session = Depends(get_db)):
 
 
 @app.put("/students/{student_id}", response_model=StudentOut)
-def update_student(student_id: int, payload: StudentUpdate, db: Session = Depends(get_db)):
+def update_student(
+    student_id: int,
+    payload: StudentUpdate,
+    db: Session = Depends(get_db),
+    _: User = Depends(require_roles("cashier", "manager", "admin")),
+):
     student = db.query(Student).filter(Student.id == student_id).first()
     if not student:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Student not found")
@@ -216,12 +264,20 @@ def update_student(student_id: int, payload: StudentUpdate, db: Session = Depend
 
 
 @app.delete("/students/{student_id}", status_code=status.HTTP_204_NO_CONTENT)
-def delete_student(student_id: int, db: Session = Depends(get_db)):
+def delete_student(
+    student_id: int,
+    db: Session = Depends(get_db),
+    _: User = Depends(require_roles("admin")),
+):
     raise HTTPException(status_code=status.HTTP_405_METHOD_NOT_ALLOWED, detail="Deleting students is disabled to protect production data")
 
 
 @app.post("/transactions", response_model=TransactionOut, status_code=status.HTTP_201_CREATED)
-def create_transaction(payload: TransactionCreate, db: Session = Depends(get_db)):
+def create_transaction(
+    payload: TransactionCreate,
+    db: Session = Depends(get_db),
+    _: User = Depends(require_roles("cashier", "manager", "admin")),
+):
     if payload.discount < 0:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid discount")
     if not payload.items:
@@ -318,7 +374,12 @@ def create_transaction(payload: TransactionCreate, db: Session = Depends(get_db)
 
 
 @app.get("/reservations", response_model=list[ReservationOut])
-def list_reservations(skip: int = 0, limit: int = 100, db: Session = Depends(get_db)):
+def list_reservations(
+    skip: int = 0,
+    limit: int = 100,
+    db: Session = Depends(get_db),
+    _: User = Depends(require_roles("cashier", "manager", "admin")),
+):
     return (
         db.query(Reservation)
         .order_by(Reservation.deposit_amount.desc(), Reservation.created_at.asc())
@@ -329,7 +390,11 @@ def list_reservations(skip: int = 0, limit: int = 100, db: Session = Depends(get
 
 
 @app.post("/reservations", response_model=ReservationOut, status_code=status.HTTP_201_CREATED)
-def create_reservation(payload: ReservationCreate, db: Session = Depends(get_db)):
+def create_reservation(
+    payload: ReservationCreate,
+    db: Session = Depends(get_db),
+    _: User = Depends(require_roles("cashier", "manager", "admin")),
+):
     if payload.deposit_amount < 0:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid deposit amount")
     if payload.quantity <= 0:
@@ -373,7 +438,12 @@ def create_reservation(payload: ReservationCreate, db: Session = Depends(get_db)
 
 
 @app.put("/reservations/{reservation_id}", response_model=ReservationOut)
-def update_reservation(reservation_id: int, payload: ReservationUpdate, db: Session = Depends(get_db)):
+def update_reservation(
+    reservation_id: int,
+    payload: ReservationUpdate,
+    db: Session = Depends(get_db),
+    _: User = Depends(require_roles("cashier", "manager", "admin")),
+):
     reservation = db.query(Reservation).filter(Reservation.id == reservation_id).first()
     if not reservation:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Reservation not found")
@@ -394,7 +464,11 @@ def update_reservation(reservation_id: int, payload: ReservationUpdate, db: Sess
 
 
 @app.delete("/reservations/{reservation_id}", status_code=status.HTTP_204_NO_CONTENT)
-def cancel_reservation(reservation_id: int, db: Session = Depends(get_db)):
+def cancel_reservation(
+    reservation_id: int,
+    db: Session = Depends(get_db),
+    _: User = Depends(require_roles("cashier", "manager", "admin")),
+):
     reservation = db.query(Reservation).filter(Reservation.id == reservation_id).first()
     if not reservation:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Reservation not found")
@@ -409,17 +483,31 @@ def cancel_reservation(reservation_id: int, db: Session = Depends(get_db)):
 
 
 @app.get("/safe/transactions", response_model=list[SafeTransactionOut])
-def list_safe_transactions(skip: int = 0, limit: int = 100, db: Session = Depends(get_db)):
+def list_safe_transactions(
+    skip: int = 0,
+    limit: int = 100,
+    db: Session = Depends(get_db),
+    _: User = Depends(require_roles("manager", "admin")),
+):
     return db.query(SafeTransaction).order_by(SafeTransaction.timestamp.desc()).offset(skip).limit(limit).all()
 
 
 @app.get("/transactions", response_model=list[TransactionOut])
-def list_transactions(skip: int = 0, limit: int = 100, db: Session = Depends(get_db)):
+def list_transactions(
+    skip: int = 0,
+    limit: int = 100,
+    db: Session = Depends(get_db),
+    _: User = Depends(require_roles("cashier", "manager", "admin")),
+):
     return db.query(Transaction).order_by(Transaction.date.desc()).offset(skip).limit(limit).all()
 
 
 @app.post("/supplies", response_model=SupplyOut, status_code=status.HTTP_201_CREATED)
-def create_supply(payload: SupplyCreate, db: Session = Depends(get_db)):
+def create_supply(
+    payload: SupplyCreate,
+    db: Session = Depends(get_db),
+    _: User = Depends(require_roles("manager", "admin")),
+):
     if payload.quantity <= 0:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid quantity")
     if payload.unit_cost < 0:
@@ -461,12 +549,21 @@ def create_supply(payload: SupplyCreate, db: Session = Depends(get_db)):
 
 
 @app.get("/supplies", response_model=list[SupplyOut])
-def list_supplies(skip: int = 0, limit: int = 100, db: Session = Depends(get_db)):
+def list_supplies(
+    skip: int = 0,
+    limit: int = 100,
+    db: Session = Depends(get_db),
+    _: User = Depends(require_roles("manager", "admin")),
+):
     return db.query(Supply).order_by(Supply.timestamp.desc()).offset(skip).limit(limit).all()
 
 
 @app.post("/receipt-archive", response_model=ReceiptArchiveOut, status_code=status.HTTP_201_CREATED)
-def archive_receipt(payload: ReceiptArchiveCreate, db: Session = Depends(get_db)):
+def archive_receipt(
+    payload: ReceiptArchiveCreate,
+    db: Session = Depends(get_db),
+    _: User = Depends(require_roles("cashier", "manager", "admin")),
+):
     try:
         serialized = json.dumps(payload.payload, ensure_ascii=False)
     except Exception:
@@ -491,7 +588,12 @@ def archive_receipt(payload: ReceiptArchiveCreate, db: Session = Depends(get_db)
 
 
 @app.get("/receipt-archive", response_model=list[ReceiptArchiveOut])
-def list_receipt_archive(skip: int = 0, limit: int = 200, db: Session = Depends(get_db)):
+def list_receipt_archive(
+    skip: int = 0,
+    limit: int = 200,
+    db: Session = Depends(get_db),
+    _: User = Depends(require_roles("manager", "admin")),
+):
     items = db.query(ReceiptArchive).order_by(ReceiptArchive.printed_at.desc()).offset(skip).limit(limit).all()
     result: list[ReceiptArchiveOut] = []
     for entry in items:
@@ -513,7 +615,10 @@ def list_receipt_archive(skip: int = 0, limit: int = 200, db: Session = Depends(
 
 
 @app.get("/reports/finance", response_model=FinanceReportOut)
-def finance_report(db: Session = Depends(get_db)):
+def finance_report(
+    db: Session = Depends(get_db),
+    _: User = Depends(require_roles("admin")),
+):
     revenue = float(
         db.query(func.coalesce(func.sum(SafeTransaction.amount), 0.0)).filter(SafeTransaction.type == "sale").scalar()
         or 0.0
@@ -541,7 +646,10 @@ def finance_report(db: Session = Depends(get_db)):
 
 
 @app.get("/reports/books", response_model=list[BookStatsOut])
-def books_report(db: Session = Depends(get_db)):
+def books_report(
+    db: Session = Depends(get_db),
+    _: User = Depends(require_roles("manager", "admin")),
+):
     sold = (
         db.query(TransactionItem.book_id, func.coalesce(func.sum(TransactionItem.quantity), 0).label("sold_qty"))
         .group_by(TransactionItem.book_id)
@@ -567,7 +675,11 @@ def books_report(db: Session = Depends(get_db)):
 
 
 @app.post("/safe/emergency-withdrawals", response_model=SafeTransactionOut, status_code=status.HTTP_201_CREATED)
-def emergency_withdrawal(payload: EmergencyWithdrawalCreate, db: Session = Depends(get_db)):
+def emergency_withdrawal(
+    payload: EmergencyWithdrawalCreate,
+    db: Session = Depends(get_db),
+    _: User = Depends(require_roles("manager", "admin")),
+):
     if payload.amount <= 0:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid withdrawal amount")
     transaction = SafeTransaction(
@@ -583,7 +695,11 @@ def emergency_withdrawal(payload: EmergencyWithdrawalCreate, db: Session = Depen
 
 
 @app.post("/audit-logs", response_model=AuditLogOut, status_code=status.HTTP_201_CREATED)
-def create_audit_log(payload: AuditLogCreate, db: Session = Depends(get_db)):
+def create_audit_log(
+    payload: AuditLogCreate,
+    db: Session = Depends(get_db),
+    _: User = Depends(require_roles("cashier", "manager", "admin")),
+):
     log = AuditLog(**payload.model_dump())
     db.add(log)
     db.commit()
@@ -592,12 +708,21 @@ def create_audit_log(payload: AuditLogCreate, db: Session = Depends(get_db)):
 
 
 @app.get("/inventory-sessions", response_model=list[InventorySessionOut])
-def list_inventory_sessions(skip: int = 0, limit: int = 100, db: Session = Depends(get_db)):
+def list_inventory_sessions(
+    skip: int = 0,
+    limit: int = 100,
+    db: Session = Depends(get_db),
+    _: User = Depends(require_roles("manager", "admin")),
+):
     return db.query(InventorySession).order_by(InventorySession.timestamp.desc()).offset(skip).limit(limit).all()
 
 
 @app.post("/inventory-sessions", response_model=InventorySessionOut, status_code=status.HTTP_201_CREATED)
-def create_inventory_session(payload: InventorySessionCreate, db: Session = Depends(get_db)):
+def create_inventory_session(
+    payload: InventorySessionCreate,
+    db: Session = Depends(get_db),
+    _: User = Depends(require_roles("manager", "admin")),
+):
     if payload.total_cash_found < 0:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid cash amount")
     current_balance = calculate_safe_balance(db)

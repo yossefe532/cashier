@@ -1,11 +1,15 @@
-from sqlalchemy import create_engine
-from sqlalchemy.orm import sessionmaker, declarative_base
+"""
+Deprecated compatibility module.
 
-DATABASE_URL = "sqlite:///./app.db"
+Single source of truth for DB engine/session/base lives in project-root `database.py`.
+This shim prevents model/engine drift for any legacy import path.
+"""
 
-engine = create_engine(
-    DATABASE_URL, connect_args={"check_same_thread": False}
-)
-SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+from pathlib import Path
+import sys
 
-Base = declarative_base()
+_ROOT = Path(__file__).resolve().parents[1]
+if str(_ROOT) not in sys.path:
+    sys.path.insert(0, str(_ROOT))
+
+from database import Base, DATABASE_URL, SessionLocal, engine  # noqa: E402,F401

@@ -1,0 +1,6 @@
+Single source migration history for Educon POS.
+
+Use:
+  alembic upgrade head
+  alembic downgrade -1
+

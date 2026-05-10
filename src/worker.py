@@ -1,4 +1,5 @@
 import json
+import os
 from datetime import datetime
 from urllib.parse import parse_qs
 
@@ -11,6 +12,17 @@ CORS_HEADERS = [
     (b"access-control-allow-methods", b"GET,POST,PUT,DELETE,OPTIONS"),
     (b"access-control-allow-headers", b"Content-Type,Authorization"),
 ]
+
+
+def _is_enabled(value) -> bool:
+    return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _legacy_worker_enabled(scope) -> bool:
+    env = scope.get("env")
+    if env and hasattr(env, "ENABLE_LEGACY_WORKER"):
+        return _is_enabled(getattr(env, "ENABLE_LEGACY_WORKER"))
+    return _is_enabled(os.getenv("ENABLE_LEGACY_WORKER", "false"))
 
 
 def _headers(extra=None):
@@ -85,6 +97,17 @@ async def app(scope, receive, send):
 
     if method == "OPTIONS":
         await _send_empty(send, 204)
+        return
+
+    if not _legacy_worker_enabled(scope):
+        await _send_json(
+            send,
+            410,
+            {
+                "detail": "Legacy worker backend is deprecated. Use canonical FastAPI backend entrypoint main.py.",
+                "source": "src/worker.py",
+            },
+        )
         return
 
     try:

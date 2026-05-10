@@ -1,79 +1,15 @@
-from datetime import datetime
-from typing import List, Optional
+"""
+Deprecated compatibility module.
 
-from pydantic import BaseModel, ConfigDict
+Single source of truth for API schemas lives in project-root `schemas.py`.
+This shim prevents response/field contract drift for any legacy import path.
+"""
 
+from pathlib import Path
+import sys
 
-class BookBase(BaseModel):
-    title: str
-    author: str
-    isbn_barcode: Optional[str] = None
-    price: float
-    stock: int
+_ROOT = Path(__file__).resolve().parents[1]
+if str(_ROOT) not in sys.path:
+    sys.path.insert(0, str(_ROOT))
 
-
-class BookCreate(BookBase):
-    pass
-
-
-class BookUpdate(BaseModel):
-    title: Optional[str] = None
-    author: Optional[str] = None
-    isbn_barcode: Optional[str] = None
-    price: Optional[float] = None
-    stock: Optional[int] = None
-
-
-class BookOut(BookBase):
-    id: int
-    model_config = ConfigDict(from_attributes=True)
-
-
-class StudentBase(BaseModel):
-    name: str
-    phone: Optional[str] = None
-    email: Optional[str] = None
-
-
-class StudentCreate(StudentBase):
-    pass
-
-
-class StudentUpdate(BaseModel):
-    name: Optional[str] = None
-    phone: Optional[str] = None
-    email: Optional[str] = None
-
-
-class StudentOut(StudentBase):
-    id: int
-    model_config = ConfigDict(from_attributes=True)
-
-
-class TransactionItemCreate(BaseModel):
-    book_id: int
-    quantity: int
-
-
-class TransactionItemOut(BaseModel):
-    id: int
-    book_id: int
-    quantity: int
-    price_at_sale: float
-    model_config = ConfigDict(from_attributes=True)
-
-
-class TransactionCreate(BaseModel):
-    student_id: int
-    discount: float = 0.0
-    items: List[TransactionItemCreate]
-
-
-class TransactionOut(BaseModel):
-    id: int
-    student_id: int
-    total_amount: float
-    discount: float
-    date: datetime
-    items: List[TransactionItemOut]
-    model_config = ConfigDict(from_attributes=True)
+from schemas import *  # noqa: F403,F401,E402
