@@ -33,9 +33,16 @@ import { hydrateCoreData, fetchBooksInsights, fetchCoreSnapshot } from './module
 import {
   createFindServerBookId,
   createFindServerStudentId,
-  enqueueSyncOperation,
   processSyncQueueOnce,
 } from './modules/sync/syncManager'
+import { enqueueOperation, persistQueueState } from './modules/sync/queueManager'
+import { runReplayCycle } from './modules/sync/replayManager'
+import { createReconnectManager } from './modules/sync/reconnectManager'
+import {
+  loadOfflineBootstrap,
+  setIdMappings,
+  setOfflineSnapshot,
+} from './modules/sync/indexedDb'
 import { archiveReceiptPayload, refreshReceiptArchiveItems } from './modules/receipt/receiptArchiveService'
 import { createSupplyRecord, refreshAccountingSnapshot } from './modules/accounting/accountingService'
 import {
@@ -285,32 +292,18 @@ const buildReceiptText = ({
   return lines.join('\n')
 }
 
-const STORAGE_KEY = 'educon-pos-state-v1'
-const SYNC_QUEUE_KEY = 'educon-pos-sync-queue-v1'
-const SYNC_MAP_KEY = 'educon-pos-sync-map-v1'
+const LEGACY_STORAGE_KEY = 'educon-pos-state-v1'
 
 const readStoredSnapshot = () => {
   if (typeof localStorage === 'undefined') return null
   try {
-    const raw = localStorage.getItem(STORAGE_KEY)
+    const raw = localStorage.getItem(LEGACY_STORAGE_KEY)
     if (!raw) return null
     const data = JSON.parse(raw)
     if (!data || typeof data !== 'object') return null
     return data
   } catch {
     return null
-  }
-}
-
-const readJsonStorage = (key, fallbackValue) => {
-  if (typeof localStorage === 'undefined') return fallbackValue
-  try {
-    const raw = localStorage.getItem(key)
-    if (!raw) return fallbackValue
-    const parsed = JSON.parse(raw)
-    return parsed ?? fallbackValue
-  } catch {
-    return fallbackValue
   }
 }
 
@@ -589,10 +582,9 @@ function App() {
   const [financeReport, setFinanceReport] = useState(null)
   const [supplies, setSupplies] = useState([])
   const [supplyForm, setSupplyForm] = useState({ bookId: '', qty: '1', unitCost: '', paid: '', supplier: '' })
-  const [syncQueue, setSyncQueue] = useState(() => readJsonStorage(SYNC_QUEUE_KEY, []))
-  const [syncMap, setSyncMap] = useState(() =>
-    readJsonStorage(SYNC_MAP_KEY, { students: {}, books: {}, reservations: {} }),
-  )
+  const [syncQueue, setSyncQueue] = useState([])
+  const [syncMap, setSyncMap] = useState({ students: {}, books: {}, reservations: {} })
+  const [offlineHydrated, setOfflineHydrated] = useState(false)
   const [isSyncing, setIsSyncing] = useState(false)
   const syncInFlightRef = useRef(false)
   const inputRef = useRef(null)
@@ -603,6 +595,57 @@ function App() {
   const isRtl = i18n.language === 'ar'
   const locale = isRtl ? 'ar-EG' : 'en-US'
   const apiRequest = useMemo(() => createApiRequest(apiBaseUrl), [])
+
+  useEffect(() => {
+    let cancelled = false
+    const hydrateOfflineState = async () => {
+      try {
+        const { snapshot, queue, mappings, receiptArchive } = await loadOfflineBootstrap()
+        if (cancelled) return
+        if (snapshot && typeof snapshot === 'object') {
+          if (typeof snapshot.useBackend === 'boolean') setUseBackend(snapshot.useBackend)
+          if (typeof snapshot.activeView === 'string') setActiveView(snapshot.activeView)
+          if (Array.isArray(snapshot.books)) setBooks(snapshot.books)
+          if (Array.isArray(snapshot.students)) setStudents(snapshot.students)
+          if (Array.isArray(snapshot.cartItems)) setCartItems(snapshot.cartItems)
+          if (typeof snapshot.searchTerm === 'string') setSearchTerm(snapshot.searchTerm)
+          if (typeof snapshot.selectedStudentId === 'string') setSelectedStudentId(snapshot.selectedStudentId)
+          if (typeof snapshot.discount === 'number') setDiscount(snapshot.discount)
+          if (Array.isArray(snapshot.pendingReservations)) setPendingReservations(snapshot.pendingReservations)
+          if (Array.isArray(snapshot.salesHistory)) setSalesHistory(snapshot.salesHistory)
+          if (Array.isArray(snapshot.withdrawals)) setWithdrawals(snapshot.withdrawals)
+          if (Array.isArray(snapshot.auditLog)) setAuditLog(snapshot.auditLog)
+          if (typeof snapshot.adminUnlocked === 'boolean') setAdminUnlocked(snapshot.adminUnlocked)
+          if (typeof snapshot.transactionCounter === 'number') setTransactionCounter(snapshot.transactionCounter)
+          if (snapshot.lastTransaction !== undefined) setLastTransaction(snapshot.lastTransaction)
+          if (snapshot.quickStudent && typeof snapshot.quickStudent === 'object') setQuickStudent(snapshot.quickStudent)
+          if (snapshot.emergencyForm && typeof snapshot.emergencyForm === 'object') setEmergencyForm(snapshot.emergencyForm)
+          if (typeof snapshot.auditStaffId === 'string') setAuditStaffId(snapshot.auditStaffId)
+          if (Array.isArray(snapshot.cancelledReservations)) setCancelledReservations(snapshot.cancelledReservations)
+          if (typeof snapshot.selectedStaffId === 'string') setSelectedStaffId(snapshot.selectedStaffId)
+          if (typeof snapshot.isDarkMode === 'boolean') setIsDarkMode(snapshot.isDarkMode)
+          if (typeof snapshot.followsUs === 'boolean') setFollowsUs(snapshot.followsUs)
+          if (typeof snapshot.adminCustomFooter === 'string') setAdminCustomFooter(snapshot.adminCustomFooter)
+          if (snapshot.adminWhatsappLinks !== undefined) _setAdminWhatsappLinks(snapshot.adminWhatsappLinks)
+          if (snapshot.adminChannelLink !== undefined) _setAdminChannelLink(snapshot.adminChannelLink)
+          if (typeof snapshot.paymentMethod === 'string') setPaymentMethod(snapshot.paymentMethod)
+          if (typeof snapshot.auditActualCash === 'string') setAuditActualCash(snapshot.auditActualCash)
+          if (Array.isArray(snapshot.walletLog)) setWalletLog(snapshot.walletLog)
+        }
+        setSyncQueue(Array.isArray(queue) ? queue : [])
+        setSyncMap(mappings && typeof mappings === 'object' ? mappings : { students: {}, books: {}, reservations: {} })
+        setReceiptArchiveItems(Array.isArray(receiptArchive) ? receiptArchive : [])
+      } catch {
+        // Fallback to in-memory/local bootstrap if IndexedDB is unavailable.
+      } finally {
+        if (!cancelled) setOfflineHydrated(true)
+      }
+    }
+    hydrateOfflineState()
+    return () => {
+      cancelled = true
+    }
+  }, [])
 
   const handleSessionExpired = useCallback(() => {
     clearAuthState()
@@ -644,6 +687,7 @@ function App() {
   }, [isRtl])
 
   useEffect(() => {
+    if (!offlineHydrated) return
     const snapshot = useBackend
       ? {
           useBackend,
@@ -688,12 +732,11 @@ function App() {
           auditActualCash,
           walletLog,
         }
-    try {
-      localStorage.setItem(STORAGE_KEY, JSON.stringify(snapshot))
-    } catch (error) {
-      void error
-    }
+    setOfflineSnapshot('app_state', snapshot).catch(() => {
+      // Keep runtime behavior even if persistence fails.
+    })
   }, [
+    offlineHydrated,
     useBackend,
     activeView,
     books,
@@ -721,27 +764,26 @@ function App() {
     adminChannelLink,
     paymentMethod,
     auditActualCash,
-    walletLog, // Depend on Wallet Log
+    walletLog,
   ])
 
   useEffect(() => {
-    try {
-      localStorage.setItem(SYNC_QUEUE_KEY, JSON.stringify(syncQueue))
-    } catch (error) {
-      void error
-    }
-  }, [syncQueue])
+    if (!offlineHydrated) return
+    persistQueueState(syncQueue).catch(() => {})
+  }, [syncQueue, offlineHydrated])
 
   useEffect(() => {
-    try {
-      localStorage.setItem(SYNC_MAP_KEY, JSON.stringify(syncMap))
-    } catch (error) {
-      void error
-    }
-  }, [syncMap])
+    if (!offlineHydrated) return
+    setIdMappings(syncMap).catch(() => {})
+  }, [syncMap, offlineHydrated])
+
+  useEffect(() => {
+    if (!offlineHydrated) return
+    setOfflineSnapshot('receipt_archive', receiptArchiveItems).catch(() => {})
+  }, [receiptArchiveItems, offlineHydrated])
 
   const enqueueSync = useCallback((operation) => {
-    enqueueSyncOperation(setSyncQueue, operation)
+    enqueueOperation({ setSyncQueue, operation }).catch(() => {})
   }, [])
 
   const findServerStudentId = useMemo(
@@ -769,29 +811,47 @@ function App() {
   )
 
   const processSyncQueue = useCallback(async () => {
-    await processSyncQueueOnce({
-      authUser,
-      useBackend,
-      syncInFlightRef,
-      setIsSyncing,
-      syncQueue,
-      setSyncQueue,
-      apiRequest,
-      findServerBookId,
-      findServerStudentId,
-      syncMapReservations: syncMap.reservations,
-      setSyncMap,
-      mapUiBookToApi,
-      mapUiStudentToApi,
+    await runReplayCycle({
+      queueSnapshot: syncQueue,
       isAuthError,
-      handleSessionExpired,
+      onAuthExpired: handleSessionExpired,
+      runReplay: async () => {
+        await processSyncQueueOnce({
+          authUser,
+          useBackend,
+          syncInFlightRef,
+          setIsSyncing,
+          syncQueue,
+          setSyncQueue,
+          apiRequest,
+          findServerBookId,
+          findServerStudentId,
+          syncMapReservations: syncMap.reservations,
+          setSyncMap,
+          mapUiBookToApi,
+          mapUiStudentToApi,
+          isAuthError,
+          handleSessionExpired,
+        })
+      },
     })
   }, [authUser, useBackend, syncQueue, apiRequest, findServerBookId, findServerStudentId, syncMap.reservations, handleSessionExpired])
 
   useEffect(() => {
-    if (!authUser || !useBackend || syncQueue.length === 0) return
+    if (!offlineHydrated || !authUser || !useBackend || syncQueue.length === 0) return
     processSyncQueue()
-  }, [authUser, useBackend, syncQueue, processSyncQueue])
+  }, [offlineHydrated, authUser, useBackend, syncQueue, processSyncQueue])
+
+  useEffect(() => {
+    if (!offlineHydrated) return
+    const manager = createReconnectManager({
+      onReconnect: async () => {
+        if (!authUser || !useBackend || syncQueue.length === 0) return
+        await processSyncQueue()
+      },
+    })
+    return manager.start()
+  }, [offlineHydrated, authUser, useBackend, syncQueue.length, processSyncQueue])
 
   useEffect(() => {
     if (!authUser) return
@@ -1862,14 +1922,10 @@ function App() {
         })
       }
     } else {
-      try {
-        const raw = localStorage.getItem('educon-pos-receipt-archive-v1')
-        const list = raw ? JSON.parse(raw) : []
-        const next = [{ id: Date.now(), payload, printedAt: new Date().toISOString() }, ...(Array.isArray(list) ? list : [])]
-        localStorage.setItem('educon-pos-receipt-archive-v1', JSON.stringify(next))
-      } catch (error) {
-        void error
-      }
+      setReceiptArchiveItems((prev) => [
+        { id: Date.now(), payload, printedAt: new Date().toISOString() },
+        ...prev,
+      ])
       enqueueSync({
         type: 'receipt_archive',
         payload: {
